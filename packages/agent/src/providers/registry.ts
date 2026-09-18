@@ -611,7 +611,8 @@ export class ProviderRegistry {
             typeof config.awsSessionToken === 'string' ? config.awsSessionToken : undefined,
         });
       }
-      case 'openai': {
+      case 'openai':
+      case 'openai-compat': {
         logger.debug('Creating OpenAIProvider', {
           hasApiKey: !!config.apiKey,
         });
