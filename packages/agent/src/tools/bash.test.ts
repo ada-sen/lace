@@ -765,4 +765,94 @@ A sync command is subject to a runtime timeout (tens of seconds) and is killed i
       expect(output.outputFiles.stdout).toBeDefined();
     });
   });
+
+  // PRI-3243: stdin was left as an open, unwritten pipe. Any command that
+  // reads from stdin when it doesn't get file args (classically: a failed
+  // `$(find ... )` substitution leaving `head`/`cat` with none) blocked
+  // forever instead of seeing immediate EOF.
+  describe('PRI-3243: stdin gets EOF instead of hanging', () => {
+    it('head with no file args (empty command substitution) returns promptly', async () => {
+      // Mirrors the reported repro: `head -8 $(find ... | head -1)` where the
+      // find returns nothing, so head is invoked with zero file args and
+      // falls back to reading stdin.
+      const result = await bashTool.execute(
+        {
+          command: 'head -8 $(find /nonexistent-dir-for-pri-3243 -name nope 2>/dev/null | head -1)',
+        },
+        toolContext
+      );
+
+      expect(result.status).toBe('completed');
+      const output = JSON.parse(result.content[0].text!) as BashOutput;
+      expect(output.exitCode).toBe(0);
+      expect(output.stdoutPreview).toBe('');
+      // The runtime should be a matter of milliseconds, not "until someone
+      // kills it by hand". Generous bound to stay robust under CI load.
+      expect(output.runtime).toBeLessThan(5000);
+    }, 10000);
+
+    it('bare cat with no args returns promptly', async () => {
+      const result = await bashTool.execute({ command: 'cat' }, toolContext);
+
+      expect(result.status).toBe('completed');
+      const output = JSON.parse(result.content[0].text!) as BashOutput;
+      expect(output.exitCode).toBe(0);
+      expect(output.stdoutPreview).toBe('');
+      expect(output.runtime).toBeLessThan(5000);
+    }, 10000);
+  });
+
+  // PRI-3243: aborting a foreground bash call only signaled the spawned
+  // shell's own pid. When the shell doesn't exec-replace itself (e.g. a
+  // pipeline, where bash forks one process per stage), the pipeline's other
+  // processes were left running as orphans instead of being killed.
+  describe('PRI-3243: abort kills the whole process group, not just the shell', () => {
+    it('kills pipeline children that are not the shell itself', async () => {
+      const tool = new BashTool();
+      const runtime = new HostToolRuntime({
+        id: `rt_bash_pgroup_test_${runtimeId++}`,
+        cwd: process.cwd(),
+      });
+      const abortController = new AbortController();
+      const pidFile = path.join(testTempDir, 'child-pid');
+
+      // `cat` here is a second process in the pipeline, distinct from the
+      // /bin/bash process the tool spawns directly. It writes its own pid so
+      // the test can check it's actually gone after abort.
+      const execPromise = tool.execute(
+        {
+          command: `sh -c 'echo $ > ${pidFile}; exec sleep 30' | cat`,
+        },
+        { signal: abortController.signal, runtime, toolTempDir: testTempDir }
+      );
+
+      // Wait for the grandchild to report its pid.
+      const deadline = Date.now() + 3000;
+      let childPid: number | undefined;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(pidFile)) {
+          const raw = fs.readFileSync(pidFile, 'utf8').trim();
+          if (raw) {
+            childPid = parseInt(raw, 10);
+            break;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(childPid).toBeDefined();
+
+      abortController.abort();
+      await execPromise;
+
+      // Give signal delivery a moment, then confirm the grandchild is gone.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      let stillAlive = true;
+      try {
+        process.kill(childPid!, 0);
+      } catch {
+        stillAlive = false;
+      }
+      expect(stillAlive).toBe(false);
+    }, 10000);
+  });
 });

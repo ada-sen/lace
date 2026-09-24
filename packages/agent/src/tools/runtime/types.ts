@@ -156,6 +156,16 @@ export interface RuntimeProcessOptions {
    * server. Ignored by the host runtime.
    */
   longLived?: boolean;
+  /**
+   * How the child's stdin is wired. Defaults to 'ignore' (equivalent to
+   * /dev/null: reads get immediate EOF) so a command that unexpectedly reads
+   * from stdin (e.g. `head` with no file args because an argument expansion
+   * came back empty) doesn't block forever on a pipe nobody is writing to or
+   * closing. Pass 'pipe' only when the caller genuinely drives stdin, e.g. an
+   * MCP server child talked to over stdio (see RuntimeStdioClientTransport).
+   * See PRI-3243.
+   */
+  stdin?: 'ignore' | 'pipe';
 }
 
 export interface RuntimeProcessResult {

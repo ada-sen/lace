@@ -104,10 +104,18 @@ A sync command is subject to a runtime timeout (tens of seconds) and is killed i
       let stdoutTailIndex = 0;
       let stderrTailIndex = 0;
 
+      // detached (POSIX only) makes the shell a process-group leader so an
+      // abort can reach pipeline children (e.g. `sleep | cat`) that would
+      // otherwise be orphaned by a kill of just the shell's own pid. stdin is
+      // 'ignore' (/dev/null) rather than an open, unwritten pipe — see
+      // RuntimeProcessOptions.stdin and PRI-3243.
+      const detached = process.platform !== 'win32';
       const childProcess = await context.runtime.process.start(['/bin/bash', '-c', command], {
         cwd: context.runtime.cwd,
         env: context.processEnv,
         signal: context.signal,
+        stdin: 'ignore',
+        detached,
       });
 
       // Set up output streams after the runtime process is started so a start failure
@@ -243,17 +251,35 @@ A sync command is subject to a runtime timeout (tens of seconds) and is killed i
           resolve(this.createError(result as unknown as Record<string, unknown>));
         };
 
+        // Kill the process, preferring the whole process group (negative
+        // pid) on POSIX so pipeline children (e.g. `sleep | cat`) don't
+        // survive as orphans when only the shell's own pid is signaled.
+        // Falls back to signaling the process directly if group-kill fails
+        // (e.g. ESRCH when the child isn't a process-group leader). See
+        // PRI-3243.
+        const killProcessOrGroup = (signal: NodeJS.Signals) => {
+          if (detached && typeof childProcess.pid === 'number') {
+            try {
+              process.kill(-childProcess.pid, signal);
+              return;
+            } catch {
+              // Fall through to direct signal below.
+            }
+          }
+          childProcess.kill(signal);
+        };
+
         // Handle abort signal
         const abortHandler = () => {
           cancelled = true;
           if (!processKilled) {
             processKilled = true;
             // First try SIGTERM
-            childProcess.kill('SIGTERM');
+            killProcessOrGroup('SIGTERM');
 
             // Give it 2 seconds to exit gracefully
             setTimeout(() => {
-              childProcess.kill('SIGKILL');
+              killProcessOrGroup('SIGKILL');
             }, 2000);
           }
         };
