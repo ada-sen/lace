@@ -57,12 +57,13 @@ Parameters:
 - background: Set to true for background execution (returns jobId immediately)
 - description: Label shown in job listings when background=true (optional)
 - progressIntervalMs: For background jobs, interval in ms for periodic progress notifications (5000-600000). **Off by default** — set this only if you want a fixed cadence regardless of subscribers. Subscribing to a job via job_notify(on=['progress'], ...) arms the timer on its own at the default cadence.
+- timeoutMs: Foreground-only. Override the default 60000ms timeout (min 1000, max 600000).
 
 When background=true, returns { jobId, status: "started" }. Use job_output(jobId) to check status/output.
 Background jobs send completion notifications automatically. Progress notifications are opt-in (see progressIntervalMs / job_notify).
 
 Default (sync): Blocks until complete. Output truncated to 100+50 lines. Chain with && or ;.
-A sync command is subject to a runtime timeout (tens of seconds) and is killed if it exceeds it — for anything long-running (installs, builds, long fetches) use background=true and poll job_output(jobId).`
+A sync command has a default timeout of 60s (tens of seconds) and is killed (SIGTERM, then SIGKILL if still alive) if it exceeds it — for anything long-running (installs, builds, long fetches) use background=true and poll job_output(jobId), or pass timeoutMs to raise the limit up to 600s.`
       );
     });
 
@@ -853,6 +854,90 @@ A sync command is subject to a runtime timeout (tens of seconds) and is killed i
         stillAlive = false;
       }
       expect(stillAlive).toBe(false);
+    }, 10000);
+  });
+
+  // PRI-3251: the bash tool's docstring has long claimed sync calls are
+  // subject to a runtime timeout, but nothing enforced one for a hung
+  // foreground call. These tests exercise the enforcement added to close
+  // that gap: a default timeout, an optional per-call override, and the
+  // same SIGTERM-then-SIGKILL process-group kill PRI-3243 added for abort.
+  describe('PRI-3251: foreground timeout is enforced', () => {
+    it('kills a hung command after timeoutMs and reports timedOut with partial output', async () => {
+      const result = await bashTool.execute(
+        { command: 'echo before-timeout; sleep 60', timeoutMs: 1000 },
+        toolContext
+      );
+
+      expect(result.status).toBe('failed');
+      const output = JSON.parse(result.content[0].text!) as BashOutput;
+      expect(output.timedOut).toBe(true);
+      expect(output.timeoutMessage).toMatch(/timed out after 1s/);
+      expect(output.stdoutPreview).toContain('before-timeout');
+      // Should return promptly (well under sleep 60), not wait it out.
+      expect(output.runtime).toBeLessThan(10000);
+    }, 15000);
+
+    it('kills grandchild processes in a pipeline, leaving no orphan', async () => {
+      const tool = new BashTool();
+      const runtime = new HostToolRuntime({
+        id: `rt_bash_timeout_pgroup_test_${runtimeId++}`,
+        cwd: process.cwd(),
+      });
+      const pidFile = path.join(testTempDir, 'timeout-child-pid');
+
+      // `cat` is a second process in the pipeline, distinct from the
+      // /bin/bash process the tool spawns directly.
+      const execPromise = tool.execute(
+        {
+          command: `sh -c 'echo $ > ${pidFile}; exec sleep 60' | cat`,
+          timeoutMs: 1000,
+        },
+        { signal: new AbortController().signal, runtime, toolTempDir: testTempDir }
+      );
+
+      const deadline = Date.now() + 3000;
+      let childPid: number | undefined;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(pidFile)) {
+          const raw = fs.readFileSync(pidFile, 'utf8').trim();
+          if (raw) {
+            childPid = parseInt(raw, 10);
+            break;
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      expect(childPid).toBeDefined();
+
+      const result = await execPromise;
+      expect(result.status).toBe('failed');
+      const output = JSON.parse(result.content[0].text!) as BashOutput;
+      expect(output.timedOut).toBe(true);
+
+      // Give signal delivery a moment, then confirm the grandchild is gone.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      let stillAlive = true;
+      try {
+        process.kill(childPid!, 0);
+      } catch {
+        stillAlive = false;
+      }
+      expect(stillAlive).toBe(false);
+    }, 15000);
+
+    it('does not delay or flag a fast command', async () => {
+      const result = await bashTool.execute(
+        { command: 'echo quick', timeoutMs: 1000 },
+        toolContext
+      );
+
+      expect(result.status).toBe('completed');
+      const output = JSON.parse(result.content[0].text!) as BashOutput;
+      expect(output.timedOut).toBe(false);
+      expect(output.timeoutMessage).toBeUndefined();
+      expect(output.stdoutPreview.trim()).toBe('quick');
+      expect(output.runtime).toBeLessThan(1000);
     }, 10000);
   });
 });
